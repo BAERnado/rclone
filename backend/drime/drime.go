@@ -1612,10 +1612,12 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		Path:   "/s3/simple/presign",
 	}
 	var presignResponse api.SimpleUploadPresignResponse
+	start := time.Now()
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &presignOpts, &presignRequest, &presignResponse)
 		return shouldRetry(ctx, resp, err)
 	})
+	fs.Debugf(o, "Presigned upload: URL request completed in %v", time.Since(start))
 	if err != nil {
 		return fmt.Errorf("failed to get presigned upload URL: %w", err)
 	}
@@ -1635,10 +1637,12 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 			"Authorization": "",
 		},
 	}
+	start = time.Now()
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err := o.fs.srv.Call(ctx, &uploadOpts)
 		return shouldRetry(ctx, resp, err)
 	})
+	fs.Debugf(o, "Presigned upload: data upload completed in %v", time.Since(start))
 	if err != nil {
 		return fmt.Errorf("failed to upload with presigned URL: %w", err)
 	}
@@ -1657,10 +1661,12 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		Path:   "/s3/entries",
 	}
 	var entryResponse api.S3EntriesResponse
+	start = time.Now()
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &entryOpts, &entryRequest, &entryResponse)
 		return shouldRetry(ctx, resp, err)
 	})
+	fs.Debugf(o, "Presigned upload: entry creation completed in %v", time.Since(start))
 	if err != nil {
 		return fmt.Errorf("failed to create entry after presigned upload: %w", err)
 	}
