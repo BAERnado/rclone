@@ -54,6 +54,9 @@ var (
 	errorTooManyArguments   = errors.New("too many arguments")
 )
 
+// PbsRsyncPatches lists private patches included in a PBS-rsync build.
+var PbsRsyncPatches string
+
 // ShowVersion prints the version to stdout
 func ShowVersion() {
 	osVersion, osKernel := buildinfo.GetOSVersion()
@@ -76,6 +79,9 @@ func ShowVersion() {
 	fmt.Printf("- go/version: %s\n", runtime.Version())
 	fmt.Printf("- go/linking: %s\n", linking)
 	fmt.Printf("- go/tags: %s\n", tagString)
+	if PbsRsyncPatches != "" {
+		fmt.Printf("pbs-rsync patches: %s\n", PbsRsyncPatches)
+	}
 }
 
 // NewFsFile creates an Fs from a name but may point to a file.
