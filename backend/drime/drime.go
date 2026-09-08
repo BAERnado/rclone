@@ -556,6 +556,9 @@ OUTER:
 		if err != nil {
 			return found, fmt.Errorf("couldn't list files: %w", err)
 		}
+		if result.CurrentPage != page {
+			return found, fmt.Errorf("pagination did not advance: requested page %d, received page %d", page, result.CurrentPage)
+		}
 		for _, item := range result.Data {
 			if item.Type == api.ItemTypeFolder {
 				if filesOnly {

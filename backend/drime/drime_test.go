@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/backend/drime/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
@@ -109,6 +110,32 @@ func TestUploadPresigned(t *testing.T) {
 	src := object.NewStaticObjectInfo(filename, time.Now(), int64(len(contents)), true, nil, nil).WithMimeType("text/plain")
 	require.NoError(t, o.uploadPresigned(context.Background(), bytes.NewBufferString(contents), src, filename, "42", filename))
 	require.Equal(t, "123", o.id)
+}
+
+func TestListAllFailsWhenPaginationDoesNotAdvance(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		page := r.URL.Query().Get("page")
+		if page == "1" {
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[]}`))
+			require.NoError(t, err)
+			return
+		}
+		require.Equal(t, "2", page)
+		_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[]}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 200},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	_, err := f.listAll(context.Background(), "42", false, false, "", func(*api.Item) bool { return false })
+	require.ErrorContains(t, err, "pagination did not advance: requested page 2, received page 1")
+	require.Equal(t, 2, requests)
 }
 
 func TestCleanUp(t *testing.T) {
