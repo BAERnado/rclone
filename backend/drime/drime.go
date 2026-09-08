@@ -686,6 +686,16 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
+	if f.shouldUsePresignedUpload(size) {
+		o := &Object{fs: f, remote: remote}
+		rootID, err := f.dirCache.RootID(ctx, true)
+		if err != nil {
+			return nil, err
+		}
+		leaf := path.Base(remote)
+		relativePath := f.opt.Enc.FromStandardPath(remote)
+		return o, o.uploadPresigned(ctx, in, src, leaf, rootID, relativePath)
+	}
 
 	o, _, _, err := f.createObject(ctx, remote, modTime, size)
 	if err != nil {
@@ -1592,7 +1602,7 @@ func (f *Fs) workspaceID() json.Number {
 }
 
 // uploadPresigned uploads an object through a presigned URL.
-func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.ObjectInfo, leaf, directoryID string) error {
+func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.ObjectInfo, leaf, directoryID, relativePath string) error {
 	mimeType := fs.MimeType(ctx, src)
 	encodedLeaf := o.fs.opt.Enc.FromStandardName(leaf)
 	extension := strings.TrimPrefix(path.Ext(encodedLeaf), ".")
@@ -1650,6 +1660,7 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		Size:            size,
 		ClientExtension: extension,
 		ParentID:        json.Number(directoryID),
+		RelativePath:    relativePath,
 		WorkspaceID:     o.fs.workspaceID(),
 	}
 	entryOpts := rest.Opts{
@@ -1745,7 +1756,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return o.setMetaData(&s.fileEntry)
 	}
 	if o.fs.shouldUsePresignedUpload(size) {
-		return o.uploadPresigned(ctx, in, src, leaf, directoryID)
+		return o.uploadPresigned(ctx, in, src, leaf, directoryID, o.fs.opt.Enc.FromStandardName(leaf))
 	}
 
 	// Do the upload

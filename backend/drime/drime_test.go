@@ -86,6 +86,7 @@ func TestUploadPresigned(t *testing.T) {
 				"clientName":      filename,
 				"filename":        "uuid",
 				"parentId":        float64(42),
+				"relativePath":    filename,
 				"size":            float64(len(contents)),
 				"workspaceId":     float64(0),
 			}, request)
@@ -106,7 +107,7 @@ func TestUploadPresigned(t *testing.T) {
 	}
 	o := &Object{fs: f, remote: filename}
 	src := object.NewStaticObjectInfo(filename, time.Now(), int64(len(contents)), true, nil, nil).WithMimeType("text/plain")
-	require.NoError(t, o.uploadPresigned(context.Background(), bytes.NewBufferString(contents), src, filename, "42"))
+	require.NoError(t, o.uploadPresigned(context.Background(), bytes.NewBufferString(contents), src, filename, "42", filename))
 	require.Equal(t, "123", o.id)
 }
 
