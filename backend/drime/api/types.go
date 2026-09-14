@@ -164,6 +164,17 @@ type SimpleUploadPresignResponse struct {
 	Status string `json:"status"`
 }
 
+// SimpleUploadPresignBatchRequest is the input to POST /s3/simple/presign-batch
+type SimpleUploadPresignBatchRequest struct {
+	Files []SimpleUploadPresignRequest `json:"files"`
+}
+
+// SimpleUploadPresignBatchResponse is returned by POST /s3/simple/presign-batch
+type SimpleUploadPresignBatchResponse struct {
+	Files  []SimpleUploadPresignResponse `json:"files"`
+	Status string                        `json:"status"`
+}
+
 // MoveRequest is the input to /file-entries/move
 type MoveRequest struct {
 	EntryIDs      []string `json:"entryIds"`
@@ -253,6 +264,25 @@ type S3EntriesRequest struct {
 // S3EntriesResponse is the result of POST /s3/entries
 type S3EntriesResponse struct {
 	FileEntry Item `json:"fileEntry"`
+}
+
+// S3EntriesBatchRequest is the input to POST /s3/entries/batch
+type S3EntriesBatchRequest struct {
+	Files []S3EntriesRequest `json:"files"`
+}
+
+// S3EntriesBatchResult describes one result from POST /s3/entries/batch
+type S3EntriesBatchResult struct {
+	Index     int    `json:"index"`
+	Status    int    `json:"status"`
+	Error     string `json:"error"`
+	FileEntry Item   `json:"fileEntry"`
+}
+
+// S3EntriesBatchResponse is returned by POST /s3/entries/batch
+type S3EntriesBatchResponse struct {
+	Results []S3EntriesBatchResult `json:"results"`
+	Status  string                 `json:"status"`
 }
 
 // MultiPartAbort is the input of POST /s3/multipart/abort

@@ -38,6 +38,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/multipart"
@@ -56,6 +57,7 @@ const (
 	minChunkSize         = fs.SizeSuffix(1024 * 1024 * 5)
 	defaultUploadCutoff  = fs.SizeSuffix(5 * 1024 * 1024) // as per https://docs.drime.cloud/uploads-guide
 	presignedUploadLimit = fs.SizeSuffix(5 * 1024 * 1024)
+	presignedBatchLimit  = 25
 )
 
 // Register with Fs
@@ -100,6 +102,20 @@ Leave this blank normally unless you wish to specify a Workspace ID.
 			Name:     "hard_delete",
 			Help:     "Delete files permanently rather than putting them into the trash.",
 			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "presigned_upload_batch_size",
+			Help: `Batch size for presigned URL requests and entry creation.
+
+Set this to a value from 2 to 25 to batch the API requests around presigned
+uploads. The file data is still uploaded individually and in parallel.
+Set this to 0 or 1 to disable batching.`,
+			Default:  0,
+			Advanced: true,
+		}, {
+			Name:     "presigned_upload_batch_timeout",
+			Help:     `Maximum time to wait for a presigned upload batch to fill.`,
+			Default:  fs.Duration(100 * time.Millisecond),
 			Advanced: true,
 		}, {
 			Name: "use_presigned_uploads",
@@ -194,6 +210,8 @@ type Options struct {
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	HardDelete          bool                 `config:"hard_delete"`
 	UsePresignedUploads bool                 `config:"use_presigned_uploads"`
+	PresignedBatchSize  int                  `config:"presigned_upload_batch_size"`
+	PresignedBatchWait  fs.Duration          `config:"presigned_upload_batch_timeout"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
 	ListChunk           int                  `config:"list_chunk"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
@@ -208,6 +226,8 @@ type Fs struct {
 	srv      *rest.Client       // the connection to the server
 	dirCache *dircache.DirCache // Map of directory path to directory id
 	pacer    *fs.Pacer          // pacer for API calls
+	presigns *batcher.Batcher[api.SimpleUploadPresignRequest, api.SimpleUploadPresignResponse]
+	entries  *batcher.Batcher[api.S3EntriesRequest, api.Item]
 }
 
 // Object describes a drime object
@@ -371,6 +391,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, fmt.Errorf("drime: chunk size: %w", err)
 	}
+	if opt.PresignedBatchSize < 0 || opt.PresignedBatchSize > presignedBatchLimit {
+		return nil, fmt.Errorf("drime: presigned upload batch size must be between 0 and %d", presignedBatchLimit)
+	}
 
 	root = parsePath(root)
 
@@ -391,6 +414,28 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.srv.SetErrorHandler(errorHandler)
 	f.srv.SetHeader("Authorization", "Bearer "+f.opt.AccessToken)
 	f.srv.SetHeader("Accept", "application/json")
+	batchMode := "off"
+	batchSize := 0
+	if f.opt.PresignedBatchSize > 1 {
+		batchMode = "sync"
+		batchSize = f.opt.PresignedBatchSize
+	}
+	batchOptions := batcher.Options{
+		Mode:               batchMode,
+		Size:               batchSize,
+		Timeout:            time.Duration(f.opt.PresignedBatchWait),
+		MaxBatchSize:       presignedBatchLimit,
+		DefaultTimeoutSync: 100 * time.Millisecond,
+	}
+	f.presigns, err = batcher.New(ctx, f, f.commitPresignBatch, batchOptions)
+	if err != nil {
+		return nil, err
+	}
+	f.entries, err = batcher.New(ctx, f, f.commitEntriesBatch, batchOptions)
+	if err != nil {
+		f.presigns.Shutdown()
+		return nil, err
+	}
 
 	// Get rootFolderID
 	rootID := f.opt.RootFolderID
@@ -1604,6 +1649,80 @@ func (f *Fs) workspaceID() json.Number {
 	return json.Number(f.opt.WorkspaceID)
 }
 
+// commitPresignBatch requests presigned URLs for a batch of files.
+func (f *Fs) commitPresignBatch(ctx context.Context, items []api.SimpleUploadPresignRequest, results []api.SimpleUploadPresignResponse, itemErrors []error) error {
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/s3/simple/presign-batch",
+	}
+	request := api.SimpleUploadPresignBatchRequest{Files: items}
+	var result api.SimpleUploadPresignBatchResponse
+	var resp *http.Response
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get presigned upload URLs: %w", err)
+	}
+	if len(result.Files) != len(items) {
+		return fmt.Errorf("presigned URL batch returned %d files for %d requests", len(result.Files), len(items))
+	}
+	for i := range result.Files {
+		if result.Files[i].URL == "" || result.Files[i].Key == "" {
+			itemErrors[i] = errors.New("response has no URL or key")
+			continue
+		}
+		results[i] = result.Files[i]
+	}
+	return nil
+}
+
+// commitEntriesBatch creates file entries for a batch of uploaded files.
+func (f *Fs) commitEntriesBatch(ctx context.Context, items []api.S3EntriesRequest, results []api.Item, itemErrors []error) error {
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/s3/entries/batch",
+	}
+	request := api.S3EntriesBatchRequest{Files: items}
+	var result api.S3EntriesBatchResponse
+	var resp *http.Response
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create entries after presigned uploads: %w", err)
+	}
+	seen := make([]bool, len(items))
+	for _, entryResult := range result.Results {
+		if entryResult.Index < 0 || entryResult.Index >= len(items) {
+			return fmt.Errorf("entry batch returned invalid index %d", entryResult.Index)
+		}
+		if seen[entryResult.Index] {
+			return fmt.Errorf("entry batch returned duplicate index %d", entryResult.Index)
+		}
+		seen[entryResult.Index] = true
+		if entryResult.Status < 200 || entryResult.Status >= 300 {
+			itemErrors[entryResult.Index] = fmt.Errorf("entry creation returned status %d: %s", entryResult.Status, entryResult.Error)
+			continue
+		}
+		if entryResult.FileEntry.ID == "" {
+			itemErrors[entryResult.Index] = errors.New("entry creation response has no ID")
+			continue
+		}
+		results[entryResult.Index] = entryResult.FileEntry
+	}
+	for i, wasSeen := range seen {
+		if !wasSeen {
+			itemErrors[i] = errors.New("entry batch returned no result")
+		}
+	}
+	return nil
+}
+
 // uploadPresigned uploads an object through a presigned URL.
 func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.ObjectInfo, leaf, directoryID, relativePath string) error {
 	mimeType := fs.MimeType(ctx, src)
@@ -1620,15 +1739,20 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		WorkspaceID: o.fs.workspaceID(),
 		ParentID:    json.Number(directoryID),
 	}
-	presignOpts := rest.Opts{
-		Method: "POST",
-		Path:   "/s3/simple/presign",
-	}
 	var presignResponse api.SimpleUploadPresignResponse
-	err := o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &presignOpts, &presignRequest, &presignResponse)
-		return shouldRetry(ctx, resp, err)
-	})
+	var err error
+	if o.fs.presigns != nil && o.fs.presigns.Batching() {
+		presignResponse, err = o.fs.presigns.Commit(ctx, o.remote, presignRequest)
+	} else {
+		presignOpts := rest.Opts{
+			Method: "POST",
+			Path:   "/s3/simple/presign",
+		}
+		err = o.fs.pacer.Call(func() (bool, error) {
+			resp, err := o.fs.srv.CallJSON(ctx, &presignOpts, &presignRequest, &presignResponse)
+			return shouldRetry(ctx, resp, err)
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get presigned upload URL: %w", err)
 	}
@@ -1666,19 +1790,25 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		RelativePath:    relativePath,
 		WorkspaceID:     o.fs.workspaceID(),
 	}
-	entryOpts := rest.Opts{
-		Method: "POST",
-		Path:   "/s3/entries",
+	var fileEntry api.Item
+	if o.fs.entries != nil && o.fs.entries.Batching() {
+		fileEntry, err = o.fs.entries.Commit(ctx, o.remote, entryRequest)
+	} else {
+		entryOpts := rest.Opts{
+			Method: "POST",
+			Path:   "/s3/entries",
+		}
+		var entryResponse api.S3EntriesResponse
+		err = o.fs.pacer.Call(func() (bool, error) {
+			resp, err := o.fs.srv.CallJSON(ctx, &entryOpts, &entryRequest, &entryResponse)
+			return shouldRetry(ctx, resp, err)
+		})
+		fileEntry = entryResponse.FileEntry
 	}
-	var entryResponse api.S3EntriesResponse
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &entryOpts, &entryRequest, &entryResponse)
-		return shouldRetry(ctx, resp, err)
-	})
 	if err != nil {
 		return fmt.Errorf("failed to create entry after presigned upload: %w", err)
 	}
-	return o.setMetaData(&entryResponse.FileEntry)
+	return o.setMetaData(&fileEntry)
 }
 
 // Open an object for read
@@ -1810,6 +1940,17 @@ func (o *Object) ParentID() string {
 	return o.dirID
 }
 
+// Shutdown flushes pending upload batches and stops their workers.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.presigns != nil {
+		f.presigns.Shutdown()
+	}
+	if f.entries != nil {
+		f.entries.Shutdown()
+	}
+	return nil
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)
@@ -1822,6 +1963,7 @@ var (
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
 	_ fs.OpenChunkWriter = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 	_ fs.ParentIDer      = (*Object)(nil)

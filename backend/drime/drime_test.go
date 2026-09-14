@@ -112,6 +112,49 @@ func TestUploadPresigned(t *testing.T) {
 	require.Equal(t, "123", o.id)
 }
 
+func TestPresignedBatchAPIs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/s3/simple/presign-batch":
+			var request api.SimpleUploadPresignBatchRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			require.Len(t, request.Files, 2)
+			_, err := w.Write([]byte(`{"files":[{"url":"https://storage/1","key":"uploads/1"},{"url":"https://storage/2","key":"uploads/2"}],"status":"success"}`))
+			require.NoError(t, err)
+		case "/s3/entries/batch":
+			var request api.S3EntriesBatchRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			require.Len(t, request.Files, 2)
+			_, err := w.Write([]byte(`{"results":[{"index":1,"status":422,"error":"bad entry"},{"index":0,"status":200,"fileEntry":{"id":123,"name":"one"}}],"status":"success"}`))
+			require.NoError(t, err)
+		default:
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	presignItems := []api.SimpleUploadPresignRequest{{Filename: "one"}, {Filename: "two"}}
+	presignResults := make([]api.SimpleUploadPresignResponse, len(presignItems))
+	presignErrors := make([]error, len(presignItems))
+	require.NoError(t, f.commitPresignBatch(context.Background(), presignItems, presignResults, presignErrors))
+	require.Equal(t, "uploads/1", presignResults[0].Key)
+	require.Equal(t, "uploads/2", presignResults[1].Key)
+	require.NoError(t, presignErrors[0])
+	require.NoError(t, presignErrors[1])
+
+	entryItems := []api.S3EntriesRequest{{ClientName: "one"}, {ClientName: "two"}}
+	entryResults := make([]api.Item, len(entryItems))
+	entryErrors := make([]error, len(entryItems))
+	require.NoError(t, f.commitEntriesBatch(context.Background(), entryItems, entryResults, entryErrors))
+	require.Equal(t, "123", entryResults[0].ID.String())
+	require.NoError(t, entryErrors[0])
+	require.ErrorContains(t, entryErrors[1], "status 422: bad entry")
+}
+
 func TestListAllFailsWhenPaginationDoesNotAdvance(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,7 @@
 set -eu
 
 output=${1:-build/rclone-drime}
-patches=drime-relative-path,pagination-fail-fast
+patches=drime-relative-path,pagination-fail-fast,presigned-upload-batches
 version=$(git describe --tags --always --dirty)
 
 mkdir -p "$(dirname "$output")"
