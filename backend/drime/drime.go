@@ -15,6 +15,8 @@ should stay under that.
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,6 +128,14 @@ upload_cutoff and files with unknown size use multipart uploads instead.`,
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "verify_uploads",
+			Help: `Verify uploaded files using Drime's server-side SHA-256 integrity check.
+
+This computes SHA-256 while uploading and verifies the stored content after the
+file entry has been created. An upload fails if verification does not succeed.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "upload_cutoff",
 			Help: `Cutoff for switching to chunked upload.
 
@@ -210,6 +220,7 @@ type Options struct {
 	ChunkSize           fs.SizeSuffix        `config:"chunk_size"`
 	HardDelete          bool                 `config:"hard_delete"`
 	UsePresignedUploads bool                 `config:"use_presigned_uploads"`
+	VerifyUploads       bool                 `config:"verify_uploads"`
 	PresignedBatchSize  int                  `config:"presigned_upload_batch_size"`
 	PresignedBatchWait  fs.Duration          `config:"presigned_upload_batch_timeout"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
@@ -742,7 +753,9 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		}
 		leaf := path.Base(remote)
 		relativePath := f.opt.Enc.FromStandardPath(remote)
-		return o, o.uploadPresigned(ctx, in, src, leaf, rootID, relativePath)
+		return o, o.uploadAndVerify(ctx, in, func(in io.Reader) error {
+			return o.uploadPresigned(ctx, in, src, leaf, rootID, relativePath)
+		})
 	}
 
 	o, _, _, err := f.createObject(ctx, remote, modTime, size)
@@ -1811,6 +1824,48 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 	return o.setMetaData(&fileEntry)
 }
 
+// uploadAndVerify uploads from in and optionally verifies the stored content.
+func (o *Object) uploadAndVerify(ctx context.Context, in io.Reader, upload func(io.Reader) error) error {
+	if !o.fs.opt.VerifyUploads {
+		return upload(in)
+	}
+	hash := sha256.New()
+	if err := upload(io.TeeReader(in, hash)); err != nil {
+		return err
+	}
+	return o.verifyIntegrity(ctx, hex.EncodeToString(hash.Sum(nil)))
+}
+
+// verifyIntegrity asks Drime to compare the stored content with sha256Hash.
+func (o *Object) verifyIntegrity(ctx context.Context, sha256Hash string) error {
+	if o.id == "" {
+		return errors.New("failed to verify upload: file entry has no ID")
+	}
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/file-entries/" + o.id + "/verify-integrity",
+	}
+	request := api.VerifyIntegrityRequest{SHA256: sha256Hash}
+	var result api.VerifyIntegrityResponse
+	var resp *http.Response
+	var err error
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to verify upload: %w", err)
+	}
+	if !result.Verified || !strings.EqualFold(result.ServerHash, sha256Hash) {
+		if result.Reason != "" {
+			return fmt.Errorf("upload integrity check failed: %s", result.Reason)
+		}
+		return fmt.Errorf("upload integrity check failed: server hash %q does not match local hash %q", result.ServerHash, sha256Hash)
+	}
+	fs.Debugf(o, "Upload integrity verified with SHA-256 %s", result.ServerHash)
+	return nil
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	if o.id == "" {
@@ -1849,6 +1904,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	remote := o.Remote()
 	size := src.Size()
+	uploadHash := sha256.New()
+	if o.fs.opt.VerifyUploads {
+		in = io.TeeReader(in, uploadHash)
+	}
+	verify := func(uploadErr error) error {
+		if uploadErr != nil || !o.fs.opt.VerifyUploads {
+			return uploadErr
+		}
+		return o.verifyIntegrity(ctx, hex.EncodeToString(uploadHash.Sum(nil)))
+	}
 
 	// Create the directory for the object if it doesn't exist
 	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
@@ -1886,10 +1951,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 		s := chunkWriter.(*drimeChunkWriter)
 
-		return o.setMetaData(&s.fileEntry)
+		return verify(o.setMetaData(&s.fileEntry))
 	}
 	if o.fs.shouldUsePresignedUpload(size) {
-		return o.uploadPresigned(ctx, in, src, leaf, directoryID, o.fs.opt.Enc.FromStandardName(leaf))
+		return verify(o.uploadPresigned(ctx, in, src, leaf, directoryID, o.fs.opt.Enc.FromStandardName(leaf)))
 	}
 
 	// Do the upload
@@ -1917,7 +1982,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
-	return o.setMetaData(&result.FileEntry)
+	return verify(o.setMetaData(&result.FileEntry))
 }
 
 // Remove an object

@@ -285,6 +285,18 @@ type S3EntriesBatchResponse struct {
 	Status  string                 `json:"status"`
 }
 
+// VerifyIntegrityRequest is the input to POST /file-entries/{id}/verify-integrity.
+type VerifyIntegrityRequest struct {
+	SHA256 string `json:"sha256"`
+}
+
+// VerifyIntegrityResponse is returned by POST /file-entries/{id}/verify-integrity.
+type VerifyIntegrityResponse struct {
+	Verified   bool   `json:"verified"`
+	ServerHash string `json:"serverHash"`
+	Reason     string `json:"reason"`
+}
+
 // MultiPartAbort is the input of POST /s3/multipart/abort
 type MultiPartAbort struct {
 	UploadID string `json:"uploadId"`

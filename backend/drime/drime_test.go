@@ -112,6 +112,50 @@ func TestUploadPresigned(t *testing.T) {
 	require.Equal(t, "123", o.id)
 }
 
+func TestUploadAndVerify(t *testing.T) {
+	const (
+		contents = "hello"
+		hash     = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/file-entries/123/verify-integrity", r.URL.Path)
+		var request api.VerifyIntegrityRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, hash, request.SHA256)
+		_, err := w.Write([]byte(`{"verified":true,"serverHash":"` + hash + `"}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{VerifyUploads: true},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	o := &Object{fs: f}
+	err := o.uploadAndVerify(context.Background(), bytes.NewBufferString(contents), func(in io.Reader) error {
+		_, err := io.Copy(io.Discard, in)
+		o.id = "123"
+		return err
+	})
+	require.NoError(t, err)
+}
+
+func TestVerifyIntegrityMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := w.Write([]byte(`{"verified":false,"serverHash":"wrong"}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	o := &Object{fs: f, id: "123"}
+	require.ErrorContains(t, o.verifyIntegrity(context.Background(), "expected"), "upload integrity check failed")
+}
+
 func TestPresignedBatchAPIs(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
