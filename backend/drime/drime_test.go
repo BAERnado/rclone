@@ -15,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/stretchr/testify/require"
@@ -222,6 +223,54 @@ func TestListAllFailsWhenPaginationDoesNotAdvance(t *testing.T) {
 	}
 	_, err := f.listAll(context.Background(), "42", false, false, "", func(*api.Item) bool { return false })
 	require.ErrorContains(t, err, "pagination did not advance: requested page 2, received page 1")
+	require.Equal(t, 2, requests)
+}
+
+func TestListRUsesParentIDBatches(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/drive/file-entries", r.URL.Path)
+		require.Empty(t, r.URL.Query().Get("folderId"))
+
+		var data string
+		switch r.URL.Query().Get("parentIds") {
+		case "1":
+			data = `[
+				{"id":2,"parent_id":1,"name":"dir","type":"folder","updated_at":"2026-01-01T00:00:00Z"},
+				{"id":5,"parent_id":1,"name":"other","type":"folder","updated_at":"2026-01-01T00:00:00Z"},
+				{"id":3,"parent_id":1,"name":"root.txt","type":"file","file_size":4,"updated_at":"2026-01-01T00:00:00Z"}
+			]`
+		case "2,5":
+			data = `[
+				{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"updated_at":"2026-01-01T00:00:00Z"},
+				{"id":6,"parent_id":5,"name":"another.txt","type":"file","file_size":7,"updated_at":"2026-01-01T00:00:00Z"}
+			]`
+		default:
+			t.Fatalf("unexpected parentIds %q", r.URL.Query().Get("parentIds"))
+		}
+		_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"data":` + data + `}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 200},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	var remotes []string
+	err := f.ListR(context.Background(), "", func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			remotes = append(remotes, entry.Remote())
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"dir", "other", "root.txt", "dir/nested.txt", "other/another.txt"}, remotes)
 	require.Equal(t, 2, requests)
 }
 

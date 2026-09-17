@@ -40,6 +40,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
@@ -60,6 +61,7 @@ const (
 	defaultUploadCutoff  = fs.SizeSuffix(5 * 1024 * 1024) // as per https://docs.drime.cloud/uploads-guide
 	presignedUploadLimit = fs.SizeSuffix(5 * 1024 * 1024)
 	presignedBatchLimit  = 25
+	listRParentBatchSize = 100
 )
 
 // Register with Fs
@@ -584,13 +586,26 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
+	parameters := url.Values{}
+	if dirID != "" {
+		parameters.Add("folderId", dirID)
+	}
+	return f.listAllWithParameters(ctx, parameters, directoriesOnly, filesOnly, name, fn)
+}
+
+// listAllParents lists entries from all the supplied parent directories.
+func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, fn listAllFn) (found bool, err error) {
+	parameters := url.Values{}
+	parameters.Set("parentIds", strings.Join(parentIDs, ","))
+	return f.listAllWithParameters(ctx, parameters, false, false, "", fn)
+}
+
+// listAllWithParameters lists entries using the supplied API parameters.
+func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/drive/file-entries",
-		Parameters: url.Values{},
-	}
-	if dirID != "" {
-		opts.Parameters.Add("folderId", dirID)
+		Parameters: parameters,
 	}
 	if directoriesOnly {
 		opts.Parameters.Add("type", api.ItemTypeFolder)
@@ -689,6 +704,56 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return nil, iErr
 	}
 	return entries, nil
+}
+
+// ListR lists the objects and directories starting at dir recursively.
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+
+	parents := map[string]string{directoryID: dir}
+	out := list.NewHelper(callback)
+	for len(parents) != 0 {
+		parentIDs := make([]string, 0, len(parents))
+		for parentID := range parents {
+			parentIDs = append(parentIDs, parentID)
+		}
+		sort.Strings(parentIDs)
+
+		nextParents := make(map[string]string)
+		for start := 0; start < len(parentIDs); start += listRParentBatchSize {
+			end := min(start+listRParentBatchSize, len(parentIDs))
+			var callbackErr error
+			_, err = f.listAllParents(ctx, parentIDs[start:end], func(info *api.Item) bool {
+				parentPath, ok := parents[info.ParentID.String()]
+				if !ok {
+					callbackErr = fmt.Errorf("received entry %q for unexpected parent ID %s", info.Name, info.ParentID.String())
+					return true
+				}
+				remote := path.Join(parentPath, info.Name)
+				entry, entryErr := f.itemToDirEntry(ctx, remote, info)
+				if entryErr != nil {
+					callbackErr = entryErr
+					return true
+				}
+				if info.Type == api.ItemTypeFolder {
+					nextParents[info.ID.String()] = remote
+				}
+				callbackErr = out.Add(entry)
+				return callbackErr != nil
+			})
+			if err != nil {
+				return err
+			}
+			if callbackErr != nil {
+				return callbackErr
+			}
+		}
+		parents = nextParents
+	}
+	return out.Flush()
 }
 
 // Creates from the parameters passed in a half finished Object which
@@ -2027,6 +2092,7 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
+	_ fs.ListRer         = (*Fs)(nil)
 	_ fs.OpenChunkWriter = (*Fs)(nil)
 	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
