@@ -243,8 +243,20 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 				{"id":3,"parent_id":1,"name":"root.txt","type":"file","file_size":4,"updated_at":"2026-01-01T00:00:00Z"}
 			]`
 		case "2,5":
+			if r.URL.Query().Get("page") == "1" {
+				_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"updated_at":"2026-01-01T00:00:00Z"}]}`))
+				require.NoError(t, err)
+				return
+			}
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[]}`))
+			require.NoError(t, err)
+			return
+		case "2":
 			data = `[
-				{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"updated_at":"2026-01-01T00:00:00Z"},
+				{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"updated_at":"2026-01-01T00:00:00Z"}
+			]`
+		case "5":
+			data = `[
 				{"id":6,"parent_id":5,"name":"another.txt","type":"file","file_size":7,"updated_at":"2026-01-01T00:00:00Z"}
 			]`
 		default:
@@ -256,7 +268,7 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 	defer server.Close()
 
 	f := &Fs{
-		opt:   Options{ListChunk: 200},
+		opt:   Options{ListChunk: 200, ListParentBatchSize: 100},
 		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
 		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
 	}
@@ -271,7 +283,39 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"dir", "other", "root.txt", "dir/nested.txt", "other/another.txt"}, remotes)
-	require.Equal(t, 2, requests)
+	require.Equal(t, 5, requests)
+}
+
+func TestListRIncreasesPageSizeForSingleParent(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		require.Equal(t, "9", r.URL.Query().Get("parentIds"))
+		if r.URL.Query().Get("perPage") == "3" {
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"total":3,"data":[{"id":1},{"id":2},{"id":3}]}`))
+			require.NoError(t, err)
+			return
+		}
+		require.Equal(t, "2", r.URL.Query().Get("perPage"))
+		if r.URL.Query().Get("page") == "1" {
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"total":3,"data":[{"id":1},{"id":2}]}`))
+			require.NoError(t, err)
+			return
+		}
+		_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"total":3,"data":[]}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 2},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	items, err := f.listAllParentsWithFallback(context.Background(), []string{"9"})
+	require.NoError(t, err)
+	require.Len(t, items, 3)
+	require.Equal(t, 3, requests)
 }
 
 func TestCleanUp(t *testing.T) {

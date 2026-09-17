@@ -61,7 +61,6 @@ const (
 	defaultUploadCutoff  = fs.SizeSuffix(5 * 1024 * 1024) // as per https://docs.drime.cloud/uploads-guide
 	presignedUploadLimit = fs.SizeSuffix(5 * 1024 * 1024)
 	presignedBatchLimit  = 25
-	listRParentBatchSize = 100
 )
 
 // Register with Fs
@@ -101,6 +100,15 @@ Leave this blank normally unless you wish to specify a Workspace ID.
 			Name:     "list_chunk",
 			Help:     `Number of items to list in each call`,
 			Default:  1000,
+			Advanced: true,
+		}, {
+			Name: "list_parent_batch_size",
+			Help: `Number of parent directories to combine in recursive listing requests.
+
+Larger values reduce the number of API requests but can require more pages per
+request. If Drime fails to advance pagination, rclone retries the request in
+smaller parent batches.`,
+			Default:  100,
 			Advanced: true,
 		}, {
 			Name:     "hard_delete",
@@ -227,6 +235,7 @@ type Options struct {
 	PresignedBatchWait  fs.Duration          `config:"presigned_upload_batch_timeout"`
 	UploadCutoff        fs.SizeSuffix        `config:"upload_cutoff"`
 	ListChunk           int                  `config:"list_chunk"`
+	ListParentBatchSize int                  `config:"list_parent_batch_size"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -407,6 +416,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.PresignedBatchSize < 0 || opt.PresignedBatchSize > presignedBatchLimit {
 		return nil, fmt.Errorf("drime: presigned upload batch size must be between 0 and %d", presignedBatchLimit)
 	}
+	if opt.ListParentBatchSize <= 0 {
+		return nil, errors.New("drime: recursive list parent batch size must be greater than zero")
+	}
 
 	root = parsePath(root)
 
@@ -579,6 +591,16 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 // Should return true to finish processing
 type listAllFn func(*api.Item) bool
 
+type paginationError struct {
+	requested int
+	received  int
+	total     int
+}
+
+func (e *paginationError) Error() string {
+	return fmt.Sprintf("pagination did not advance: requested page %d, received page %d", e.requested, e.received)
+}
+
 // Lists the directory required calling the user function on each item found
 //
 // If name is set then the server will limit the returned items to those
@@ -590,18 +612,18 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	if dirID != "" {
 		parameters.Add("folderId", dirID)
 	}
-	return f.listAllWithParameters(ctx, parameters, directoriesOnly, filesOnly, name, fn)
+	return f.listAllWithParameters(ctx, parameters, f.opt.ListChunk, directoriesOnly, filesOnly, name, fn)
 }
 
 // listAllParents lists entries from all the supplied parent directories.
-func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, perPage int, fn listAllFn) (found bool, err error) {
 	parameters := url.Values{}
 	parameters.Set("parentIds", strings.Join(parentIDs, ","))
-	return f.listAllWithParameters(ctx, parameters, false, false, "", fn)
+	return f.listAllWithParameters(ctx, parameters, perPage, false, false, "", fn)
 }
 
 // listAllWithParameters lists entries using the supplied API parameters.
-func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, perPage int, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/drive/file-entries",
@@ -613,7 +635,7 @@ func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, d
 	if f.opt.WorkspaceID != "" {
 		opts.Parameters.Set("workspaceId", f.opt.WorkspaceID)
 	}
-	opts.Parameters.Set("perPage", strconv.Itoa(f.opt.ListChunk))
+	opts.Parameters.Set("perPage", strconv.Itoa(perPage))
 	page := 1
 OUTER:
 	for {
@@ -628,7 +650,7 @@ OUTER:
 			return found, fmt.Errorf("couldn't list files: %w", err)
 		}
 		if result.CurrentPage != page {
-			return found, fmt.Errorf("pagination did not advance: requested page %d, received page %d", page, result.CurrentPage)
+			return found, &paginationError{requested: page, received: result.CurrentPage, total: result.Total}
 		}
 		for _, item := range result.Data {
 			if item.Type == api.ItemTypeFolder {
@@ -652,6 +674,43 @@ OUTER:
 		page = result.CurrentPage + 1
 	}
 	return found, err
+}
+
+// listAllParentsWithFallback retries pagination failures with smaller parent batches.
+func (f *Fs) listAllParentsWithFallback(ctx context.Context, parentIDs []string) ([]api.Item, error) {
+	return f.listAllParentsWithPageSize(ctx, parentIDs, f.opt.ListChunk)
+}
+
+func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string, perPage int) ([]api.Item, error) {
+	var items []api.Item
+	_, err := f.listAllParents(ctx, parentIDs, perPage, func(info *api.Item) bool {
+		items = append(items, *info)
+		return false
+	})
+	if err == nil {
+		return items, nil
+	}
+	var pageErr *paginationError
+	if !errors.As(err, &pageErr) {
+		return nil, err
+	}
+	if len(parentIDs) == 1 {
+		if pageErr.total > perPage {
+			return f.listAllParentsWithPageSize(ctx, parentIDs, pageErr.total)
+		}
+		return nil, err
+	}
+
+	middle := len(parentIDs) / 2
+	left, err := f.listAllParentsWithFallback(ctx, parentIDs[:middle])
+	if err != nil {
+		return nil, err
+	}
+	right, err := f.listAllParentsWithFallback(ctx, parentIDs[middle:])
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
 }
 
 // Convert a list item into a DirEntry
@@ -723,32 +782,29 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		sort.Strings(parentIDs)
 
 		nextParents := make(map[string]string)
-		for start := 0; start < len(parentIDs); start += listRParentBatchSize {
-			end := min(start+listRParentBatchSize, len(parentIDs))
-			var callbackErr error
-			_, err = f.listAllParents(ctx, parentIDs[start:end], func(info *api.Item) bool {
+		for start := 0; start < len(parentIDs); start += f.opt.ListParentBatchSize {
+			end := min(start+f.opt.ListParentBatchSize, len(parentIDs))
+			items, listErr := f.listAllParentsWithFallback(ctx, parentIDs[start:end])
+			if listErr != nil {
+				return listErr
+			}
+			for i := range items {
+				info := &items[i]
 				parentPath, ok := parents[info.ParentID.String()]
 				if !ok {
-					callbackErr = fmt.Errorf("received entry %q for unexpected parent ID %s", info.Name, info.ParentID.String())
-					return true
+					return fmt.Errorf("received entry %q for unexpected parent ID %s", info.Name, info.ParentID.String())
 				}
 				remote := path.Join(parentPath, info.Name)
 				entry, entryErr := f.itemToDirEntry(ctx, remote, info)
 				if entryErr != nil {
-					callbackErr = entryErr
-					return true
+					return entryErr
 				}
 				if info.Type == api.ItemTypeFolder {
 					nextParents[info.ID.String()] = remote
 				}
-				callbackErr = out.Add(entry)
-				return callbackErr != nil
-			})
-			if err != nil {
-				return err
-			}
-			if callbackErr != nil {
-				return callbackErr
+				if err = out.Add(entry); err != nil {
+					return err
+				}
 			}
 		}
 		parents = nextParents
