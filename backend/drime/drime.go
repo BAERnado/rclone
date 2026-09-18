@@ -107,7 +107,7 @@ Leave this blank normally unless you wish to specify a Workspace ID.
 
 Larger values reduce the number of API requests but can require more pages per
 request. If Drime fails to advance pagination, rclone retries the request in
-smaller parent batches.`,
+smaller parent batches or combines verified forward and reverse listings.`,
 			Default:  100,
 			Advanced: true,
 		}, {
@@ -616,9 +616,11 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 }
 
 // listAllParents lists entries from all the supplied parent directories.
-func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, perPage int, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, perPage int, orderDir string, fn listAllFn) (found bool, err error) {
 	parameters := url.Values{}
 	parameters.Set("parentIds", strings.Join(parentIDs, ","))
+	parameters.Set("orderBy", "name")
+	parameters.Set("orderDir", orderDir)
 	return f.listAllWithParameters(ctx, parameters, perPage, false, false, "", fn)
 }
 
@@ -685,11 +687,7 @@ func (f *Fs) listAllParentsWithFallback(ctx context.Context, parentIDs []string)
 }
 
 func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string, perPage int) ([]api.Item, error) {
-	var items []api.Item
-	_, err := f.listAllParents(ctx, parentIDs, perPage, func(info *api.Item) bool {
-		items = append(items, *info)
-		return false
-	})
+	items, err := f.listAllParentsOrdered(ctx, parentIDs, perPage, "asc")
 	if err == nil {
 		return items, nil
 	}
@@ -697,23 +695,67 @@ func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string,
 	if !errors.As(err, &pageErr) {
 		return nil, err
 	}
-	if len(parentIDs) == 1 {
-		if pageErr.total > perPage {
-			return f.listAllParentsWithPageSize(ctx, parentIDs, pageErr.total)
+	if len(parentIDs) != 1 {
+		middle := len(parentIDs) / 2
+		left, err := f.listAllParentsWithFallback(ctx, parentIDs[:middle])
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		right, err := f.listAllParentsWithFallback(ctx, parentIDs[middle:])
+		if err != nil {
+			return nil, err
+		}
+		return append(left, right...), nil
 	}
 
-	middle := len(parentIDs) / 2
-	left, err := f.listAllParentsWithFallback(ctx, parentIDs[:middle])
-	if err != nil {
-		return nil, err
+	forwardErr := err
+	if pageErr.total > perPage {
+		items, err = f.listAllParentsOrdered(ctx, parentIDs, pageErr.total, "asc")
+		if err == nil {
+			return items, nil
+		}
+		if !errors.As(err, &pageErr) {
+			return nil, err
+		}
+		forwardErr = err
 	}
-	right, err := f.listAllParentsWithFallback(ctx, parentIDs[middle:])
-	if err != nil {
-		return nil, err
+
+	reverseItems, reverseErr := f.listAllParentsOrdered(ctx, parentIDs, max(perPage, pageErr.total), "desc")
+	if reverseErr == nil {
+		return reverseItems, nil
 	}
-	return append(left, right...), nil
+	var reversePageErr *paginationError
+	if !errors.As(reverseErr, &reversePageErr) {
+		return nil, reverseErr
+	}
+	if reversePageErr.total != pageErr.total {
+		return nil, fmt.Errorf("pagination recovery total changed from %d to %d", pageErr.total, reversePageErr.total)
+	}
+
+	byID := make(map[string]api.Item, len(items)+len(reverseItems))
+	for _, item := range append(items, reverseItems...) {
+		if item.ID == "" {
+			return nil, errors.New("pagination recovery received entry without ID")
+		}
+		byID[item.ID.String()] = item
+	}
+	if len(byID) != pageErr.total {
+		return nil, fmt.Errorf("pagination recovery found %d of %d entries: %w", len(byID), pageErr.total, forwardErr)
+	}
+	items = items[:0]
+	for _, item := range byID {
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (f *Fs) listAllParentsOrdered(ctx context.Context, parentIDs []string, perPage int, orderDir string) ([]api.Item, error) {
+	var items []api.Item
+	_, err := f.listAllParents(ctx, parentIDs, perPage, orderDir, func(info *api.Item) bool {
+		items = append(items, *info)
+		return false
+	})
+	return items, err
 }
 
 // Convert a list item into a DirEntry

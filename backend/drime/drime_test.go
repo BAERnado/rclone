@@ -339,6 +339,50 @@ func TestListRIncreasesPageSizeForSingleParent(t *testing.T) {
 	require.Equal(t, 3, requests)
 }
 
+func TestListRCombinesForwardAndReversePages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		orderDir := r.URL.Query().Get("orderDir")
+		var data string
+		if orderDir == "asc" {
+			switch page {
+			case "1":
+				data = `[{"id":1},{"id":2}]`
+			case "2":
+				data = `[{"id":3},{"id":4}]`
+			default:
+				_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"total":5,"data":[]}`))
+				require.NoError(t, err)
+				return
+			}
+		} else {
+			require.Equal(t, "desc", orderDir)
+			switch page {
+			case "1":
+				data = `[{"id":5},{"id":4}]`
+			case "2":
+				data = `[{"id":3},{"id":2}]`
+			default:
+				_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"total":5,"data":[]}`))
+				require.NoError(t, err)
+				return
+			}
+		}
+		_, err := w.Write([]byte(`{"current_page":` + page + `,"last_page":3,"total":5,"data":` + data + `}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 2},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	items, err := f.listAllParentsWithFallback(context.Background(), []string{"9"})
+	require.NoError(t, err)
+	require.Len(t, items, 5)
+}
+
 func TestCleanUp(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, http.MethodPost, r.Method)
