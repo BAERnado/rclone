@@ -226,6 +226,27 @@ func TestListAllFailsWhenPaginationDoesNotAdvance(t *testing.T) {
 	require.Equal(t, 2, requests)
 }
 
+func TestListAllUsesNameQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "42", r.URL.Query().Get("folderId"))
+		require.Equal(t, "wanted", r.URL.Query().Get("query"))
+		_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"data":[{"id":7,"parent_id":42,"name":"wanted","type":"folder"}]}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 200},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	found, err := f.listAll(context.Background(), "42", true, false, "wanted", func(item *api.Item) bool {
+		return item.Name == "wanted"
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+}
+
 func TestListRUsesParentIDBatches(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

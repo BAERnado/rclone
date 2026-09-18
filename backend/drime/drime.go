@@ -632,6 +632,9 @@ func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, p
 	if directoriesOnly {
 		opts.Parameters.Add("type", api.ItemTypeFolder)
 	}
+	if name != "" {
+		opts.Parameters.Set("query", f.opt.Enc.FromStandardName(name))
+	}
 	if f.opt.WorkspaceID != "" {
 		opts.Parameters.Set("workspaceId", f.opt.WorkspaceID)
 	}
