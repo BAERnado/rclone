@@ -107,9 +107,8 @@ Leave this blank normally unless you wish to specify a Workspace ID.
 			Help: `Number of parent directories to combine in recursive listing requests.
 
 Larger values reduce the number of API requests but can require more pages per
-request. If Drime fails to advance pagination, rclone retries the request in
-smaller parent batches or continues single-directory listings using creation
-time windows.`,
+request. If Drime fails to advance pagination, rclone continues the parent
+batch using creation-time windows.`,
 			Default:  100,
 			Advanced: true,
 		}, {
@@ -620,15 +619,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	return f.listAllWithParameters(ctx, parameters, f.opt.ListChunk, directoriesOnly, filesOnly, name, fn)
 }
 
-// listAllParents lists entries from all the supplied parent directories.
-func (f *Fs) listAllParents(ctx context.Context, parentIDs []string, perPage int, orderDir string, fn listAllFn) (found bool, err error) {
-	parameters := url.Values{}
-	parameters.Set("parentIds", strings.Join(parentIDs, ","))
-	parameters.Set("orderBy", "name")
-	parameters.Set("orderDir", orderDir)
-	return f.listAllWithParameters(ctx, parameters, perPage, false, false, "", fn)
-}
-
 // listAllWithParameters lists entries using the supplied API parameters.
 func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, perPage int, directoriesOnly bool, filesOnly bool, name string, fn listAllFn) (found bool, err error) {
 	opts := rest.Opts{
@@ -696,42 +686,14 @@ OUTER:
 	return found, err
 }
 
-// listAllParentsWithFallback retries pagination failures with smaller parent batches.
+// listAllParentsWithFallback continues pagination failures with creation-time windows.
 func (f *Fs) listAllParentsWithFallback(ctx context.Context, parentIDs []string) ([]api.Item, error) {
-	return f.listAllParentsWithPageSize(ctx, parentIDs, f.opt.ListChunk)
-}
-
-func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string, perPage int) ([]api.Item, error) {
-	if len(parentIDs) == 1 {
-		return f.listAllParentByCreatedAt(ctx, parentIDs[0], perPage)
-	}
-	items, err := f.listAllParentsOrdered(ctx, parentIDs, perPage, "asc")
-	if err == nil {
-		return items, nil
-	}
-	var pageErr *paginationError
-	if !errors.As(err, &pageErr) {
-		return nil, err
-	}
-	if len(parentIDs) != 1 {
-		middle := len(parentIDs) / 2
-		left, err := f.listAllParentsWithFallback(ctx, parentIDs[:middle])
-		if err != nil {
-			return nil, err
-		}
-		right, err := f.listAllParentsWithFallback(ctx, parentIDs[middle:])
-		if err != nil {
-			return nil, err
-		}
-		return append(left, right...), nil
-	}
-
-	return nil, err
+	return f.listAllParentsByCreatedAt(ctx, parentIDs, f.opt.ListChunk)
 }
 
 type listingFilter struct {
 	Key      string `json:"key"`
-	Value    string `json:"value"`
+	Value    any    `json:"value"`
 	Operator string `json:"operator"`
 }
 
@@ -743,14 +705,23 @@ func encodeListingFilters(filters ...listingFilter) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// listAllParentByCreatedAt resumes capped listings using inclusive creation-time windows.
-func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perPage int) ([]api.Item, error) {
+// listAllParentsByCreatedAt resumes capped listings using inclusive creation-time windows.
+func (f *Fs) listAllParentsByCreatedAt(ctx context.Context, parentIDs []string, perPage int) ([]api.Item, error) {
 	var cursor time.Time
 	seen := make(map[string]struct{})
+	parents := make(map[string]struct{}, len(parentIDs))
+	for _, parentID := range parentIDs {
+		parents[parentID] = struct{}{}
+	}
+	parentFilter := listingFilter{Key: "parent_id", Value: parentIDs, Operator: "in"}
+	if len(parentIDs) == 1 {
+		parentFilter.Value = parentIDs[0]
+		parentFilter.Operator = "="
+	}
 	var items []api.Item
 	for {
 		parameters := url.Values{}
-		parameters.Set("parentIds", parentID)
+		parameters.Set("parentIds", strings.Join(parentIDs, ","))
 		parameters.Set("orderBy", "created_at")
 		parameters.Set("orderDir", "asc")
 		if !cursor.IsZero() {
@@ -760,11 +731,7 @@ func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perP
 					Value:    cursor.Format(time.RFC3339Nano),
 					Operator: ">=",
 				},
-				listingFilter{
-					Key:      "parent_id",
-					Value:    parentID,
-					Operator: "=",
-				},
+				parentFilter,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to encode listing filter: %w", err)
@@ -778,6 +745,10 @@ func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perP
 			id := info.ID.String()
 			if id == "" {
 				itemErr = errors.New("pagination recovery received entry without ID")
+				return true
+			}
+			if _, ok := parents[info.ParentID.String()]; !ok {
+				itemErr = fmt.Errorf("pagination recovery received entry %q for unexpected parent ID %s", info.Name, info.ParentID.String())
 				return true
 			}
 			if _, ok := seen[id]; !ok {
@@ -804,15 +775,6 @@ func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perP
 		}
 		cursor = windowCursor
 	}
-}
-
-func (f *Fs) listAllParentsOrdered(ctx context.Context, parentIDs []string, perPage int, orderDir string) ([]api.Item, error) {
-	var items []api.Item
-	_, err := f.listAllParents(ctx, parentIDs, perPage, orderDir, func(info *api.Item) bool {
-		items = append(items, *info)
-		return false
-	})
-	return items, err
 }
 
 // Convert a list item into a DirEntry

@@ -264,8 +264,23 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 				{"id":3,"parent_id":1,"name":"root.txt","type":"file","file_size":4,"updated_at":"2026-01-01T00:00:00Z"}
 			]`
 		case "2,5":
+			if r.URL.Query().Get("filters") != "" {
+				cursor := time.Date(2026, 1, 1, 0, 0, 4, 0, time.UTC)
+				wantFilter, err := encodeListingFilters(
+					listingFilter{Key: "created_at", Value: cursor.Format(time.RFC3339Nano), Operator: ">="},
+					listingFilter{Key: "parent_id", Value: []string{"2", "5"}, Operator: "in"},
+				)
+				require.NoError(t, err)
+				require.Equal(t, wantFilter, r.URL.Query().Get("filters"))
+				_, err = w.Write([]byte(`{"current_page":1,"last_page":1,"data":[
+					{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"created_at":"2026-01-01T00:00:04Z","updated_at":"2026-01-01T00:00:00Z"},
+					{"id":6,"parent_id":5,"name":"another.txt","type":"file","file_size":7,"created_at":"2026-01-01T00:00:05Z","updated_at":"2026-01-01T00:00:00Z"}
+				]}`))
+				require.NoError(t, err)
+				return
+			}
 			if r.URL.Query().Get("page") == "1" {
-				_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"updated_at":"2026-01-01T00:00:00Z"}]}`))
+				_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[{"id":4,"parent_id":2,"name":"nested.txt","type":"file","file_size":6,"created_at":"2026-01-01T00:00:04Z","updated_at":"2026-01-01T00:00:00Z"}]}`))
 				require.NoError(t, err)
 				return
 			}
@@ -304,7 +319,7 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"dir", "other", "root.txt", "dir/nested.txt", "other/another.txt"}, remotes)
-	require.Equal(t, 5, requests)
+	require.Equal(t, 4, requests)
 }
 
 func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
@@ -324,8 +339,8 @@ func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 			require.Equal(t, wantFilter, r.URL.Query().Get("filters"))
 			require.Equal(t, "1", r.URL.Query().Get("page"))
 			_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"data":[
-				{"id":4,"created_at":"2026-01-01T00:00:04Z"},
-				{"id":5,"created_at":"2026-01-01T00:00:05Z"}
+				{"id":4,"parent_id":9,"created_at":"2026-01-01T00:00:04Z"},
+				{"id":5,"parent_id":9,"created_at":"2026-01-01T00:00:05Z"}
 			]}`))
 			require.NoError(t, err)
 			return
@@ -334,14 +349,14 @@ func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 		switch r.URL.Query().Get("page") {
 		case "1":
 			_, err := w.Write([]byte(`{"current_page":1,"last_page":3,"data":[
-				{"id":1,"created_at":"2026-01-01T00:00:01Z"},
-				{"id":2,"created_at":"2026-01-01T00:00:02Z"}
+				{"id":1,"parent_id":9,"created_at":"2026-01-01T00:00:01Z"},
+				{"id":2,"parent_id":9,"created_at":"2026-01-01T00:00:02Z"}
 			]}`))
 			require.NoError(t, err)
 		case "2":
 			_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"data":[
-				{"id":3,"created_at":"2026-01-01T00:00:03Z"},
-				{"id":4,"created_at":"2026-01-01T00:00:04Z"}
+				{"id":3,"parent_id":9,"created_at":"2026-01-01T00:00:03Z"},
+				{"id":4,"parent_id":9,"created_at":"2026-01-01T00:00:04Z"}
 			]}`))
 			require.NoError(t, err)
 		default:
@@ -365,6 +380,32 @@ func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 	}
 	require.Equal(t, []string{"1", "2", "3", "4", "5"}, gotIDs)
 	require.Equal(t, 4, requests)
+}
+
+func TestListRStopsWhenCreatedAtCursorDoesNotAdvance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "1" {
+			id := "1"
+			if r.URL.Query().Get("filters") != "" {
+				id = "2"
+			}
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[{"id":` + id + `,"parent_id":9,"created_at":"2026-01-01T00:00:01Z"}]}`))
+			require.NoError(t, err)
+			return
+		}
+		_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[]}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 1},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	_, err := f.listAllParentsWithFallback(context.Background(), []string{"9"})
+	require.ErrorContains(t, err, "pagination creation-time cursor did not advance")
 }
 
 func TestListAllDetectsRepeatedPageEntries(t *testing.T) {
