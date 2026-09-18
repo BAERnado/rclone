@@ -307,69 +307,44 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 	require.Equal(t, 5, requests)
 }
 
-func TestListRIncreasesPageSizeForSingleParent(t *testing.T) {
+func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 	requests := 0
+	cursor := time.Date(2026, 1, 1, 0, 0, 4, 0, time.UTC)
+	wantFilter, err := encodeListingFilter(listingFilter{Key: "created_at", Value: cursor.Format(time.RFC3339Nano), Operator: ">="})
+	require.NoError(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		require.Equal(t, "9", r.URL.Query().Get("parentIds"))
-		if r.URL.Query().Get("perPage") == "3" {
-			_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"total":3,"data":[{"id":1},{"id":2},{"id":3}]}`))
+		require.Equal(t, "created_at", r.URL.Query().Get("orderBy"))
+		require.Equal(t, "asc", r.URL.Query().Get("orderDir"))
+		if r.URL.Query().Get("filters") != "" {
+			require.Equal(t, wantFilter, r.URL.Query().Get("filters"))
+			require.Equal(t, "1", r.URL.Query().Get("page"))
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"data":[
+				{"id":4,"created_at":"2026-01-01T00:00:04Z"},
+				{"id":5,"created_at":"2026-01-01T00:00:05Z"}
+			]}`))
 			require.NoError(t, err)
 			return
 		}
 		require.Equal(t, "2", r.URL.Query().Get("perPage"))
-		if r.URL.Query().Get("page") == "1" {
-			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"total":3,"data":[{"id":1},{"id":2}]}`))
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":3,"data":[
+				{"id":1,"created_at":"2026-01-01T00:00:01Z"},
+				{"id":2,"created_at":"2026-01-01T00:00:02Z"}
+			]}`))
 			require.NoError(t, err)
-			return
+		case "2":
+			_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"data":[
+				{"id":3,"created_at":"2026-01-01T00:00:03Z"},
+				{"id":4,"created_at":"2026-01-01T00:00:04Z"}
+			]}`))
+			require.NoError(t, err)
+		default:
+			_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"data":[]}`))
+			require.NoError(t, err)
 		}
-		_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"total":3,"data":[]}`))
-		require.NoError(t, err)
-	}))
-	defer server.Close()
-
-	f := &Fs{
-		opt:   Options{ListChunk: 2},
-		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
-		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
-	}
-	items, err := f.listAllParentsWithFallback(context.Background(), []string{"9"})
-	require.NoError(t, err)
-	require.Len(t, items, 3)
-	require.Equal(t, 3, requests)
-}
-
-func TestListRCombinesForwardAndReversePages(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page := r.URL.Query().Get("page")
-		orderDir := r.URL.Query().Get("orderDir")
-		var data string
-		if orderDir == "asc" {
-			switch page {
-			case "1":
-				data = `[{"id":1},{"id":2}]`
-			case "2":
-				data = `[{"id":3},{"id":4}]`
-			default:
-				_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"total":5,"data":[]}`))
-				require.NoError(t, err)
-				return
-			}
-		} else {
-			require.Equal(t, "desc", orderDir)
-			switch page {
-			case "1":
-				data = `[{"id":5},{"id":4}]`
-			case "2":
-				data = `[{"id":3},{"id":2}]`
-			default:
-				_, err := w.Write([]byte(`{"current_page":2,"last_page":3,"total":5,"data":[]}`))
-				require.NoError(t, err)
-				return
-			}
-		}
-		_, err := w.Write([]byte(`{"current_page":` + page + `,"last_page":3,"total":5,"data":` + data + `}`))
-		require.NoError(t, err)
 	}))
 	defer server.Close()
 
@@ -381,6 +356,29 @@ func TestListRCombinesForwardAndReversePages(t *testing.T) {
 	items, err := f.listAllParentsWithFallback(context.Background(), []string{"9"})
 	require.NoError(t, err)
 	require.Len(t, items, 5)
+	gotIDs := make([]string, len(items))
+	for i := range items {
+		gotIDs[i] = items[i].ID.String()
+	}
+	require.Equal(t, []string{"1", "2", "3", "4", "5"}, gotIDs)
+	require.Equal(t, 4, requests)
+}
+
+func TestListAllDetectsRepeatedPageEntries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		_, err := w.Write([]byte(`{"current_page":` + page + `,"last_page":3,"data":[{"id":1},{"id":2}]}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 2},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	_, err := f.listAll(context.Background(), "9", false, false, "", func(*api.Item) bool { return false })
+	require.ErrorContains(t, err, "pagination repeated the entries from page 1")
 }
 
 func TestCleanUp(t *testing.T) {

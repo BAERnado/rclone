@@ -16,6 +16,7 @@ should stay under that.
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -107,7 +108,8 @@ Leave this blank normally unless you wish to specify a Workspace ID.
 
 Larger values reduce the number of API requests but can require more pages per
 request. If Drime fails to advance pagination, rclone retries the request in
-smaller parent batches or combines verified forward and reverse listings.`,
+smaller parent batches or continues single-directory listings using creation
+time windows.`,
 			Default:  100,
 			Advanced: true,
 		}, {
@@ -594,10 +596,13 @@ type listAllFn func(*api.Item) bool
 type paginationError struct {
 	requested int
 	received  int
-	total     int
+	repeated  bool
 }
 
 func (e *paginationError) Error() string {
+	if e.repeated {
+		return fmt.Sprintf("pagination repeated the entries from page %d", e.requested-1)
+	}
 	return fmt.Sprintf("pagination did not advance: requested page %d, received page %d", e.requested, e.received)
 }
 
@@ -642,6 +647,7 @@ func (f *Fs) listAllWithParameters(ctx context.Context, parameters url.Values, p
 	}
 	opts.Parameters.Set("perPage", strconv.Itoa(perPage))
 	page := 1
+	previousPageIDs := ""
 OUTER:
 	for {
 		opts.Parameters.Set("page", strconv.Itoa(page))
@@ -655,8 +661,17 @@ OUTER:
 			return found, fmt.Errorf("couldn't list files: %w", err)
 		}
 		if result.CurrentPage != page {
-			return found, &paginationError{requested: page, received: result.CurrentPage, total: result.Total}
+			return found, &paginationError{requested: page, received: result.CurrentPage}
 		}
+		pageIDs := make([]string, len(result.Data))
+		for i := range result.Data {
+			pageIDs[i] = result.Data[i].ID.String()
+		}
+		pageFingerprint := strings.Join(pageIDs, ",")
+		if page > 1 && len(result.Data) != 0 && pageFingerprint == previousPageIDs {
+			return found, &paginationError{requested: page, received: result.CurrentPage, repeated: true}
+		}
+		previousPageIDs = pageFingerprint
 		for _, item := range result.Data {
 			if item.Type == api.ItemTypeFolder {
 				if filesOnly {
@@ -687,6 +702,9 @@ func (f *Fs) listAllParentsWithFallback(ctx context.Context, parentIDs []string)
 }
 
 func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string, perPage int) ([]api.Item, error) {
+	if len(parentIDs) == 1 {
+		return f.listAllParentByCreatedAt(ctx, parentIDs[0], perPage)
+	}
 	items, err := f.listAllParentsOrdered(ctx, parentIDs, perPage, "asc")
 	if err == nil {
 		return items, nil
@@ -708,45 +726,77 @@ func (f *Fs) listAllParentsWithPageSize(ctx context.Context, parentIDs []string,
 		return append(left, right...), nil
 	}
 
-	forwardErr := err
-	if pageErr.total > perPage {
-		items, err = f.listAllParentsOrdered(ctx, parentIDs, pageErr.total, "asc")
+	return nil, err
+}
+
+type listingFilter struct {
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	Operator string `json:"operator"`
+}
+
+func encodeListingFilter(filter listingFilter) (string, error) {
+	data, err := json.Marshal([]listingFilter{filter})
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// listAllParentByCreatedAt resumes capped listings using inclusive creation-time windows.
+func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perPage int) ([]api.Item, error) {
+	var cursor time.Time
+	seen := make(map[string]struct{})
+	var items []api.Item
+	for {
+		parameters := url.Values{}
+		parameters.Set("parentIds", parentID)
+		parameters.Set("orderBy", "created_at")
+		parameters.Set("orderDir", "asc")
+		if !cursor.IsZero() {
+			filter, err := encodeListingFilter(listingFilter{
+				Key:      "created_at",
+				Value:    cursor.Format(time.RFC3339Nano),
+				Operator: ">=",
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode listing filter: %w", err)
+			}
+			parameters.Set("filters", filter)
+		}
+
+		windowCursor := cursor
+		var itemErr error
+		_, err := f.listAllWithParameters(ctx, parameters, perPage, false, false, "", func(info *api.Item) bool {
+			id := info.ID.String()
+			if id == "" {
+				itemErr = errors.New("pagination recovery received entry without ID")
+				return true
+			}
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				items = append(items, *info)
+			}
+			if info.CreatedAt.After(windowCursor) {
+				windowCursor = info.CreatedAt
+			}
+			return false
+		})
+		if itemErr != nil {
+			return nil, itemErr
+		}
 		if err == nil {
 			return items, nil
 		}
+		var pageErr *paginationError
 		if !errors.As(err, &pageErr) {
 			return nil, err
 		}
-		forwardErr = err
-	}
-
-	reverseItems, reverseErr := f.listAllParentsOrdered(ctx, parentIDs, max(perPage, pageErr.total), "desc")
-	if reverseErr == nil {
-		return reverseItems, nil
-	}
-	var reversePageErr *paginationError
-	if !errors.As(reverseErr, &reversePageErr) {
-		return nil, reverseErr
-	}
-	if reversePageErr.total != pageErr.total {
-		return nil, fmt.Errorf("pagination recovery total changed from %d to %d", pageErr.total, reversePageErr.total)
-	}
-
-	byID := make(map[string]api.Item, len(items)+len(reverseItems))
-	for _, item := range append(items, reverseItems...) {
-		if item.ID == "" {
-			return nil, errors.New("pagination recovery received entry without ID")
+		if !windowCursor.After(cursor) {
+			return nil, fmt.Errorf("pagination creation-time cursor did not advance beyond %s: %w", cursor.Format(time.RFC3339Nano), err)
 		}
-		byID[item.ID.String()] = item
+		cursor = windowCursor
 	}
-	if len(byID) != pageErr.total {
-		return nil, fmt.Errorf("pagination recovery found %d of %d entries: %w", len(byID), pageErr.total, forwardErr)
-	}
-	items = items[:0]
-	for _, item := range byID {
-		items = append(items, item)
-	}
-	return items, nil
 }
 
 func (f *Fs) listAllParentsOrdered(ctx context.Context, parentIDs []string, perPage int, orderDir string) ([]api.Item, error) {
