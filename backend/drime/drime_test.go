@@ -310,7 +310,10 @@ func TestListRUsesParentIDBatches(t *testing.T) {
 func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 	requests := 0
 	cursor := time.Date(2026, 1, 1, 0, 0, 4, 0, time.UTC)
-	wantFilter, err := encodeListingFilter(listingFilter{Key: "created_at", Value: cursor.Format(time.RFC3339Nano), Operator: ">="})
+	wantFilter, err := encodeListingFilters(
+		listingFilter{Key: "created_at", Value: cursor.Format(time.RFC3339Nano), Operator: ">="},
+		listingFilter{Key: "parent_id", Value: "9", Operator: "="},
+	)
 	require.NoError(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++

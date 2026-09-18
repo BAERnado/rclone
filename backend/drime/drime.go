@@ -735,8 +735,8 @@ type listingFilter struct {
 	Operator string `json:"operator"`
 }
 
-func encodeListingFilter(filter listingFilter) (string, error) {
-	data, err := json.Marshal([]listingFilter{filter})
+func encodeListingFilters(filters ...listingFilter) (string, error) {
+	data, err := json.Marshal(filters)
 	if err != nil {
 		return "", err
 	}
@@ -754,11 +754,18 @@ func (f *Fs) listAllParentByCreatedAt(ctx context.Context, parentID string, perP
 		parameters.Set("orderBy", "created_at")
 		parameters.Set("orderDir", "asc")
 		if !cursor.IsZero() {
-			filter, err := encodeListingFilter(listingFilter{
-				Key:      "created_at",
-				Value:    cursor.Format(time.RFC3339Nano),
-				Operator: ">=",
-			})
+			filter, err := encodeListingFilters(
+				listingFilter{
+					Key:      "created_at",
+					Value:    cursor.Format(time.RFC3339Nano),
+					Operator: ">=",
+				},
+				listingFilter{
+					Key:      "parent_id",
+					Value:    parentID,
+					Operator: "=",
+				},
+			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to encode listing filter: %w", err)
 			}
