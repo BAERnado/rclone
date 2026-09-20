@@ -242,15 +242,190 @@ type Options struct {
 
 // Fs represents a remote drime
 type Fs struct {
-	name     string             // name of this remote
-	root     string             // the path we are working on
-	opt      Options            // parsed options
-	features *fs.Features       // optional features
-	srv      *rest.Client       // the connection to the server
-	dirCache *dircache.DirCache // Map of directory path to directory id
-	pacer    *fs.Pacer          // pacer for API calls
-	presigns *batcher.Batcher[api.SimpleUploadPresignRequest, api.SimpleUploadPresignResponse]
-	entries  *batcher.Batcher[api.S3EntriesRequest, api.Item]
+	name        string             // name of this remote
+	root        string             // the path we are working on
+	opt         Options            // parsed options
+	features    *fs.Features       // optional features
+	srv         *rest.Client       // the connection to the server
+	dirCache    *dircache.DirCache // Map of directory path to directory id
+	pacer       *fs.Pacer          // pacer for API calls
+	uploadPaths *uploadPathCoordinator
+	presigns    *batcher.Batcher[api.SimpleUploadPresignRequest, api.SimpleUploadPresignResponse]
+	entries     *batcher.Batcher[api.S3EntriesRequest, api.Item]
+}
+
+type uploadPathTask struct {
+	done chan struct{}
+	once sync.Once
+}
+
+type uploadPathState struct {
+	ready bool
+	task  *uploadPathTask
+}
+
+// uploadPathCoordinator serializes first use of overlapping directory paths.
+type uploadPathCoordinator struct {
+	mu    sync.Mutex
+	paths map[string]uploadPathState
+}
+
+func newUploadPathCoordinator() *uploadPathCoordinator {
+	return &uploadPathCoordinator{paths: make(map[string]uploadPathState)}
+}
+
+func pathPrefixes(dir string) []string {
+	dir = strings.Trim(dir, "/")
+	if dir == "" || dir == "." {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	prefixes := make([]string, len(parts))
+	for i := range parts {
+		prefixes[i] = path.Join(parts[:i+1]...)
+	}
+	return prefixes
+}
+
+func (c *uploadPathCoordinator) begin(ctx context.Context, dir string) (func(bool), error) {
+	prefixes := pathPrefixes(dir)
+	for {
+		c.mu.Lock()
+		var wait *uploadPathTask
+		for _, prefix := range prefixes {
+			state := c.paths[prefix]
+			if !state.ready && state.task != nil {
+				wait = state.task
+				break
+			}
+		}
+		if wait == nil {
+			task := &uploadPathTask{done: make(chan struct{})}
+			claimed := make([]string, 0, len(prefixes))
+			for _, prefix := range prefixes {
+				state := c.paths[prefix]
+				if state.ready {
+					continue
+				}
+				state.task = task
+				c.paths[prefix] = state
+				claimed = append(claimed, prefix)
+			}
+			c.mu.Unlock()
+
+			var finishOnce sync.Once
+			return func(success bool) {
+				finishOnce.Do(func() {
+					c.mu.Lock()
+					for _, prefix := range claimed {
+						state := c.paths[prefix]
+						if state.task != task {
+							continue
+						}
+						if success {
+							state.ready = true
+							state.task = nil
+							c.paths[prefix] = state
+						} else {
+							delete(c.paths, prefix)
+						}
+					}
+					c.mu.Unlock()
+					task.once.Do(func() { close(task.done) })
+				})
+			}, nil
+		}
+		c.mu.Unlock()
+
+		select {
+		case <-wait.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (c *uploadPathCoordinator) markReady(dir string) {
+	prefixes := pathPrefixes(dir)
+	var tasks []*uploadPathTask
+	c.mu.Lock()
+	for _, prefix := range prefixes {
+		state := c.paths[prefix]
+		if state.task != nil {
+			tasks = append(tasks, state.task)
+		}
+		state.ready = true
+		state.task = nil
+		c.paths[prefix] = state
+	}
+	c.mu.Unlock()
+	for _, task := range tasks {
+		task.once.Do(func() { close(task.done) })
+	}
+}
+
+func pathHasExactSegment(remote, segment string) bool {
+	for _, part := range strings.Split(strings.Trim(remote, "/"), "/") {
+		if part == segment {
+			return true
+		}
+	}
+	return false
+}
+
+type uploadTarget struct {
+	leaf         string
+	parentID     string
+	relativePath string
+	finish       func(bool)
+}
+
+func (f *Fs) prepareUploadTarget(ctx context.Context, remote string) (target uploadTarget, err error) {
+	if f.uploadPaths == nil {
+		f.uploadPaths = newUploadPathCoordinator()
+	}
+	dir, leaf := dircache.SplitPath(remote)
+	finish, err := f.uploadPaths.begin(ctx, dir)
+	if err != nil {
+		return target, err
+	}
+
+	encodedPath := f.opt.Enc.FromStandardPath(remote)
+	if pathHasExactSegment(encodedPath, "0") {
+		leaf, parentID, findErr := f.dirCache.FindPath(ctx, remote, true)
+		finish(findErr == nil)
+		if findErr != nil {
+			return target, findErr
+		}
+		return uploadTarget{
+			leaf:         leaf,
+			parentID:     parentID,
+			relativePath: f.opt.Enc.FromStandardName(leaf),
+			finish:       func(bool) {},
+		}, nil
+	}
+
+	parentID, err := f.dirCache.RootID(ctx, true)
+	if err != nil {
+		finish(false)
+		return target, err
+	}
+	return uploadTarget{
+		leaf:         leaf,
+		parentID:     parentID,
+		relativePath: encodedPath,
+		finish:       finish,
+	}, nil
+}
+
+func (f *Fs) finishUploadTarget(remote string, target uploadTarget, success bool, parentID string) {
+	if success && parentID != "" {
+		dir, _ := dircache.SplitPath(remote)
+		if dir != "" {
+			f.dirCache.Put(dir, parentID)
+		}
+	}
+	target.finish(success)
 }
 
 // Object describes a drime object
@@ -426,11 +601,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	client := fshttp.NewClient(ctx)
 
 	f := &Fs{
-		name:  name,
-		root:  root,
-		opt:   *opt,
-		srv:   rest.NewClient(client).SetRoot(rootURL),
-		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:        name,
+		root:        root,
+		opt:         *opt,
+		srv:         rest.NewClient(client).SetRoot(rootURL),
+		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		uploadPaths: newUploadPathCoordinator(),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -782,6 +958,9 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, info *api.Item) 
 	if info.Type == api.ItemTypeFolder {
 		// cache the directory ID for later lookups
 		f.dirCache.Put(remote, info.ID.String())
+		if f.uploadPaths != nil {
+			f.uploadPaths.markReady(remote)
+		}
 		entry = fs.NewDir(remote, info.UpdatedAt).
 			SetSize(info.FileSize).
 			SetID(info.ID.String()).
@@ -927,32 +1106,16 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 //
 // The new object may have been created if an error is returned
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	remote := src.Remote()
-	size := src.Size()
-	modTime := src.ModTime(ctx)
-	if f.shouldUsePresignedUpload(size) {
-		o := &Object{fs: f, remote: remote}
-		rootID, err := f.dirCache.RootID(ctx, true)
-		if err != nil {
-			return nil, err
-		}
-		leaf := path.Base(remote)
-		relativePath := f.opt.Enc.FromStandardPath(remote)
-		return o, o.uploadAndVerify(ctx, in, func(in io.Reader) error {
-			return o.uploadPresigned(ctx, in, src, leaf, rootID, relativePath)
-		})
-	}
-
-	o, _, _, err := f.createObject(ctx, remote, modTime, size)
-	if err != nil {
-		return nil, err
-	}
+	o := &Object{fs: f, remote: src.Remote()}
 	return o, o.Update(ctx, in, src, options...)
 }
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	_, err := f.dirCache.FindDir(ctx, dir, true)
+	if err == nil && f.uploadPaths != nil {
+		f.uploadPaths.markReady(dir)
+	}
 	return err
 }
 
@@ -1434,6 +1597,7 @@ type drimeChunkWriter struct {
 	extension    string
 	parentID     json.Number
 	relativePath string
+	finishPath   func(bool)
 
 	completedPartsMu sync.Mutex
 	completedParts   []api.CompletedPart
@@ -1444,16 +1608,16 @@ type drimeChunkWriter struct {
 // Pass in the remote and the src object
 // You can also use options to hint at the desired chunk size
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
-	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+	target, err := f.prepareUploadTarget(ctx, remote)
 	if err != nil {
 		return info, nil, err
 	}
-
-	// Send just the leaf as relativePath, matching the single-part /uploads
-	// convention. The file is placed by parentId; sending an absolute path
-	// here makes the server build folders from it and drop "0" path segments.
-	relPath := f.opt.Enc.FromStandardName(leaf)
+	keepPath := false
+	defer func() {
+		if !keepPath {
+			target.finish(false)
+		}
+	}()
 
 	// Temporary Object under construction
 	o := &Object{
@@ -1483,12 +1647,12 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 
 	// Initiate multipart upload
 	req := api.MultiPartCreateRequest{
-		Filename:     leaf,
+		Filename:     target.leaf,
 		Mime:         fs.MimeType(ctx, src),
 		Size:         createSize,
-		Extension:    strings.TrimPrefix(path.Ext(leaf), `.`),
-		ParentID:     json.Number(directoryID),
-		RelativePath: relPath,
+		Extension:    strings.TrimPrefix(path.Ext(target.leaf), `.`),
+		ParentID:     json.Number(target.parentID),
+		RelativePath: target.relativePath,
 		WorkspaceID:  f.opt.WorkspaceID,
 	}
 
@@ -1510,7 +1674,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	}
 
 	mime := fs.MimeType(ctx, src)
-	ext := strings.TrimPrefix(path.Ext(leaf), ".")
+	ext := strings.TrimPrefix(path.Ext(target.leaf), ".")
 	// must have file extension for multipart upload
 	if ext == "" {
 		ext = "bin"
@@ -1523,17 +1687,19 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		f:            f,
 		o:            o,
 		uploadName:   path.Base(resp.Key),
-		leaf:         leaf,
+		leaf:         target.leaf,
 		mime:         mime,
 		extension:    ext,
-		parentID:     json.Number(directoryID),
-		relativePath: relPath,
+		parentID:     json.Number(target.parentID),
+		relativePath: target.relativePath,
+		finishPath:   target.finish,
 	}
 	info = fs.ChunkWriterInfo{
 		ChunkSize:         int64(chunkSize),
 		Concurrency:       f.opt.UploadConcurrency,
 		LeavePartsOnError: false,
 	}
+	keepPath = true
 	return info, chunkWriter, err
 }
 
@@ -1626,7 +1792,8 @@ func (s *drimeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, read
 }
 
 // Close complete chunked writer finalising the file.
-func (s *drimeChunkWriter) Close(ctx context.Context) error {
+func (s *drimeChunkWriter) Close(ctx context.Context) (err error) {
+	defer func() { s.finishPath(err == nil) }()
 	s.completedPartsMu.Lock()
 	defer s.completedPartsMu.Unlock()
 
@@ -1648,7 +1815,7 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 
 	var response api.MultiPartCompleteResponse
 
-	err := s.f.pacer.Call(func() (bool, error) {
+	err = s.f.pacer.Call(func() (bool, error) {
 		res, err := s.f.srv.CallJSON(ctx, &completeOpts, completeBody, &response)
 		return shouldRetry(ctx, res, err)
 	})
@@ -1688,6 +1855,12 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 		return fmt.Errorf("failed to create entry after multipart upload: %w", err)
 	}
 	s.fileEntry = res.FileEntry
+	if parentID := res.FileEntry.ParentID.String(); parentID != "" {
+		dir, _ := dircache.SplitPath(s.o.remote)
+		if dir != "" {
+			s.f.dirCache.Put(dir, parentID)
+		}
+	}
 
 	return nil
 }
@@ -1696,6 +1869,7 @@ func (s *drimeChunkWriter) Close(ctx context.Context) error {
 //
 // You can and should call Abort without calling Close.
 func (s *drimeChunkWriter) Abort(ctx context.Context) error {
+	defer s.finishPath(false)
 	opts := rest.Opts{
 		Method:     "POST",
 		Path:       "/s3/multipart/abort",
@@ -2100,12 +2274,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return o.verifyIntegrity(ctx, hex.EncodeToString(uploadHash.Sum(nil)))
 	}
 
-	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
-	if err != nil {
-		return err
-	}
-
 	// If the file exists, delete it after a successful upload
 	if o.id != "" {
 		id := o.id
@@ -2138,20 +2306,27 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 		return verify(o.setMetaData(&s.fileEntry))
 	}
+
+	target, err := o.fs.prepareUploadTarget(ctx, remote)
+	if err != nil {
+		return err
+	}
 	if o.fs.shouldUsePresignedUpload(size) {
-		return verify(o.uploadPresigned(ctx, in, src, leaf, directoryID, o.fs.opt.Enc.FromStandardName(leaf)))
+		uploadErr := o.uploadPresigned(ctx, in, src, target.leaf, target.parentID, target.relativePath)
+		o.fs.finishUploadTarget(remote, target, uploadErr == nil, o.dirID)
+		return verify(uploadErr)
 	}
 
 	// Do the upload
 	var resp *http.Response
 	var result api.UploadResponse
-	var encodedLeaf = o.fs.opt.Enc.FromStandardName(leaf)
+	var encodedLeaf = o.fs.opt.Enc.FromStandardName(target.leaf)
 	opts := rest.Opts{
 		Method: "POST",
 		Body:   in,
 		MultipartParams: url.Values{
-			"parentId":     {directoryID},
-			"relativePath": {encodedLeaf},
+			"parentId":     {target.parentID},
+			"relativePath": {target.relativePath},
 			"workspaceId":  {o.fs.opt.WorkspaceID},
 		},
 		MultipartContentName: "file",
@@ -2165,9 +2340,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		target.finish(false)
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
-	return verify(o.setMetaData(&result.FileEntry))
+	uploadErr := o.setMetaData(&result.FileEntry)
+	o.fs.finishUploadTarget(remote, target, uploadErr == nil, o.dirID)
+	return verify(uploadErr)
 }
 
 // Remove an object

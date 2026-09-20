@@ -47,6 +47,58 @@ func TestShouldUsePresignedUpload(t *testing.T) {
 	}
 }
 
+func TestPathHasExactSegment(t *testing.T) {
+	for _, test := range []struct {
+		path string
+		want bool
+	}{
+		{path: "missing/0/deep/file.bin", want: true},
+		{path: "/missing/0/deep/file.bin", want: true},
+		{path: "0", want: true},
+		{path: "missing/0000/deep/file.bin", want: false},
+		{path: "missing/10/deep/file.bin", want: false},
+		{path: "missing/00a0/deep/file.bin", want: false},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			require.Equal(t, test.want, pathHasExactSegment(test.path, "0"))
+		})
+	}
+}
+
+func TestUploadPathCoordinatorWaitsForOverlappingPrefix(t *testing.T) {
+	coordinator := newUploadPathCoordinator()
+	finishFirst, err := coordinator.begin(context.Background(), "safe/x")
+	require.NoError(t, err)
+
+	started := make(chan struct{})
+	type result struct {
+		finish func(bool)
+		err    error
+	}
+	acquired := make(chan result, 1)
+	go func() {
+		close(started)
+		finish, err := coordinator.begin(context.Background(), "safe/0")
+		acquired <- result{finish: finish, err: err}
+	}()
+	<-started
+
+	select {
+	case <-acquired:
+		t.Fatal("overlapping path acquired before the shared prefix was ready")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	finishFirst(true)
+	select {
+	case second := <-acquired:
+		require.NoError(t, second.err)
+		second.finish(true)
+	case <-time.After(time.Second):
+		t.Fatal("overlapping path did not resume after the shared prefix became ready")
+	}
+}
+
 func TestUploadPresigned(t *testing.T) {
 	const (
 		contents      = "hello"
