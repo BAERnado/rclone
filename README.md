@@ -16,6 +16,11 @@
 [![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
 [![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
 
+> [!IMPORTANT]
+> This is the community-maintained **Drime preview branch**, not an official
+> rclone release. See [DRIME_PREVIEW.md](DRIME_PREVIEW.md) before using it,
+> especially the documented risks around replacing existing files.
+
 # Rclone
 
 Rclone *("rsync for cloud storage")* is a command-line program to sync files and
