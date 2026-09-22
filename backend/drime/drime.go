@@ -988,22 +988,18 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if err != nil {
 		return nil, err
 	}
-	var iErr error
-	_, err = f.listAll(ctx, directoryID, false, false, "", func(info *api.Item) bool {
-		remote := path.Join(dir, info.Name)
-		entry, err := f.itemToDirEntry(ctx, remote, info)
-		if err != nil {
-			iErr = err
-			return true
-		}
-		entries = append(entries, entry)
-		return false
-	})
+	items, err := f.listAllParentsWithFallback(ctx, []string{directoryID})
 	if err != nil {
 		return nil, err
 	}
-	if iErr != nil {
-		return nil, iErr
+	for i := range items {
+		info := &items[i]
+		remote := path.Join(dir, info.Name)
+		entry, err := f.itemToDirEntry(ctx, remote, info)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }

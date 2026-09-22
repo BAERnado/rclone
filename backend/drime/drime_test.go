@@ -434,6 +434,53 @@ func TestListRContinuesSingleParentByCreatedAt(t *testing.T) {
 	require.Equal(t, 4, requests)
 }
 
+func TestListContinuesSingleParentByCreatedAt(t *testing.T) {
+	requests := 0
+	cursor := time.Date(2026, 1, 1, 0, 0, 2, 0, time.UTC)
+	wantFilter, err := encodeListingFilters(
+		listingFilter{Key: "created_at", Value: cursor.Format(time.RFC3339Nano), Operator: ">="},
+		listingFilter{Key: "parent_id", Value: "9", Operator: "="},
+	)
+	require.NoError(t, err)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		require.Equal(t, "9", r.URL.Query().Get("parentIds"))
+		if r.URL.Query().Get("filters") != "" {
+			require.Equal(t, wantFilter, r.URL.Query().Get("filters"))
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":1,"data":[
+				{"id":2,"parent_id":9,"name":"two","type":"folder","created_at":"2026-01-01T00:00:02Z","updated_at":"2026-01-01T00:00:00Z"},
+				{"id":3,"parent_id":9,"name":"three","type":"file","file_size":3,"created_at":"2026-01-01T00:00:03Z","updated_at":"2026-01-01T00:00:00Z"}
+			]}`))
+			require.NoError(t, err)
+			return
+		}
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[
+				{"id":1,"parent_id":9,"name":"one","type":"folder","created_at":"2026-01-01T00:00:01Z","updated_at":"2026-01-01T00:00:00Z"},
+				{"id":2,"parent_id":9,"name":"two","type":"folder","created_at":"2026-01-01T00:00:02Z","updated_at":"2026-01-01T00:00:00Z"}
+			]}`))
+			require.NoError(t, err)
+		default:
+			_, err := w.Write([]byte(`{"current_page":1,"last_page":2,"data":[]}`))
+			require.NoError(t, err)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		opt:   Options{ListChunk: 2},
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	f.dirCache = dircache.New("", "9", f)
+	entries, err := f.List(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+	require.Equal(t, []string{"one", "two", "three"}, []string{entries[0].Remote(), entries[1].Remote(), entries[2].Remote()})
+	require.Equal(t, 3, requests)
+}
+
 func TestListRStopsWhenCreatedAtCursorDoesNotAdvance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		page := r.URL.Query().Get("page")
