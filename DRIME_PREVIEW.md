@@ -19,6 +19,8 @@ binary that created a remote.
   create the same directory.
 - Uploaded content can be checked with Drime's server-side SHA-256 integrity
   endpoint.
+- Uploads preserve the source modification time, and `--refresh-times` can
+  repair timestamps of existing files without re-uploading their contents.
 - Recursive listings combine multiple parent IDs to reduce metadata requests.
 - Recursive pagination detects repeated pages and continues through bounded
   creation-time windows.
@@ -80,6 +82,20 @@ password2 = YOUR_OBSCURED_SALT
 verify the stored file after indexing. Drime does not expose that SHA-256 as a
 normal rclone hash, so this option is independent of rclone's `--checksum`
 flag.
+
+Drime currently omits `client_last_modified` from listings when the User-Agent
+contains `rclone`. Use a neutral User-Agent for syncs, timestamp repair, and
+mounts so the backend can read the stored modification time:
+
+```text
+--user-agent drime-preview/1.0
+```
+
+Legacy files uploaded without this support have `client_last_modified: null`.
+After upgrading, their timestamps can be repaired from an authoritative source
+with `copy` or `sync --refresh-times`. This performs one metadata request per
+corrected file. On hashless remotes such as crypt, rclone identifies matching
+files by path and size, so use this only when that identity is trustworthy.
 
 ## Initial transfer recommendations
 
