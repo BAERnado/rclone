@@ -48,6 +48,7 @@ type Item struct {
 	ParentID     json.Number `json:"parent_id"`
 	CreatedAt    time.Time   `json:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at"`
+	ClientMtime  *int64      `json:"client_last_modified"`
 	DeletedAt    any         `json:"deleted_at"`
 	IsDeleted    int         `json:"is_deleted"`
 	Path         string      `json:"path"`
@@ -259,6 +260,18 @@ type S3EntriesRequest struct {
 	ParentID        json.Number `json:"parentId"`
 	RelativePath    string      `json:"relativePath,omitempty"`
 	WorkspaceID     json.Number `json:"workspaceId"`
+	LastModified    int64       `json:"lastModified,omitempty"`
+}
+
+// SetMetadataRequest is the input to POST /file-entries/{id}/metadata.
+type SetMetadataRequest struct {
+	LastModified int64 `json:"lastModified"`
+}
+
+// SetMetadataResponse is returned by POST /file-entries/{id}/metadata.
+type SetMetadataResponse struct {
+	Status  string `json:"status"`
+	Updated bool   `json:"updated"`
 }
 
 // S3EntriesResponse is the result of POST /s3/entries

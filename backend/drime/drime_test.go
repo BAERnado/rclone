@@ -104,6 +104,7 @@ func TestUploadPresigned(t *testing.T) {
 		contents      = "hello"
 		authorization = "Bearer secret"
 		filename      = "371add24d1b9ee47aa4912e2a5f9f608"
+		lastModified  = int64(946782245000)
 	)
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +140,7 @@ func TestUploadPresigned(t *testing.T) {
 				"clientMime":      "text/plain",
 				"clientName":      filename,
 				"filename":        "uuid",
+				"lastModified":    float64(lastModified),
 				"parentId":        float64(42),
 				"relativePath":    filename,
 				"size":            float64(len(contents)),
@@ -160,7 +162,7 @@ func TestUploadPresigned(t *testing.T) {
 		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
 	}
 	o := &Object{fs: f, remote: filename}
-	src := object.NewStaticObjectInfo(filename, time.Now(), int64(len(contents)), true, nil, nil).WithMimeType("text/plain")
+	src := object.NewStaticObjectInfo(filename, time.UnixMilli(lastModified), int64(len(contents)), true, nil, nil).WithMimeType("text/plain")
 	require.NoError(t, o.uploadPresigned(context.Background(), bytes.NewBufferString(contents), src, filename, "42", filename))
 	require.Equal(t, "123", o.id)
 }
@@ -192,6 +194,40 @@ func TestUploadAndVerify(t *testing.T) {
 		return err
 	})
 	require.NoError(t, err)
+}
+
+func TestObjectModTimeUsesClientLastModified(t *testing.T) {
+	clientLastModified := int64(946782245000)
+	updatedAt := time.Date(2026, 9, 22, 14, 36, 35, 0, time.UTC)
+	o := &Object{}
+	o.setMetaDataAny(&api.Item{UpdatedAt: updatedAt, ClientMtime: &clientLastModified})
+	require.Equal(t, time.UnixMilli(clientLastModified), o.modTime)
+
+	o.setMetaDataAny(&api.Item{UpdatedAt: updatedAt})
+	require.Equal(t, updatedAt, o.modTime)
+}
+
+func TestSetModTime(t *testing.T) {
+	want := time.Date(2000, 1, 2, 3, 4, 5, 678000000, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/file-entries/123/metadata", r.URL.Path)
+		var request api.SetMetadataRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, want.UnixMilli(), request.LastModified)
+		_, err := w.Write([]byte(`{"status":"success","updated":true}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
+		pacer: fs.NewPacer(context.Background(), pacer.NewDefault()),
+	}
+	o := &Object{fs: f, id: "123"}
+	require.NoError(t, o.SetModTime(context.Background(), want))
+	require.Equal(t, want, o.modTime)
+	require.Equal(t, time.Millisecond, f.Precision())
 }
 
 func TestVerifyIntegrityMismatch(t *testing.T) {
