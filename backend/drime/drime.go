@@ -1214,7 +1214,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision return the precision of this Fs
 func (f *Fs) Precision() time.Duration {
-	return fs.ModTimeNotSupported
+	return time.Millisecond
 }
 
 // Purge deletes all the files and the container
@@ -1593,6 +1593,7 @@ type drimeChunkWriter struct {
 	extension    string
 	parentID     json.Number
 	relativePath string
+	lastModified int64
 	finishPath   func(bool)
 
 	completedPartsMu sync.Mutex
@@ -1688,6 +1689,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		extension:    ext,
 		parentID:     json.Number(target.parentID),
 		relativePath: target.relativePath,
+		lastModified: src.ModTime(ctx).UnixMilli(),
 		finishPath:   target.finish,
 	}
 	info = fs.ChunkWriterInfo{
@@ -1835,6 +1837,7 @@ func (s *drimeChunkWriter) Close(ctx context.Context) (err error) {
 		ParentID:        s.parentID,
 		RelativePath:    s.relativePath,
 		WorkspaceID:     s.f.workspaceID(),
+		LastModified:    s.lastModified,
 	}
 
 	entriesOpts := rest.Opts{
@@ -1953,7 +1956,11 @@ func (o *Object) Size() int64 {
 // setMetaDataAny sets the metadata from info but doesn't check the type
 func (o *Object) setMetaDataAny(info *api.Item) {
 	o.size = info.FileSize
-	o.modTime = info.UpdatedAt
+	if info.ClientMtime != nil {
+		o.modTime = time.UnixMilli(*info.ClientMtime)
+	} else {
+		o.modTime = info.UpdatedAt
+	}
 	o.id = info.ID.String()
 	o.dirID = info.ParentID.String()
 	o.mimeType = info.Mime
@@ -1993,7 +2000,26 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	return fs.ErrorCantSetModTime
+	request := api.SetMetadataRequest{LastModified: modTime.UnixMilli()}
+	var result api.SetMetadataResponse
+	var resp *http.Response
+	var err error
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/file-entries/" + o.id + "/metadata",
+	}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.CallJSON(ctx, &opts, &request, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set modification time: %w", err)
+	}
+	if !result.Updated {
+		return errors.New("failed to set modification time: metadata was not updated")
+	}
+	o.modTime = modTime
+	return nil
 }
 
 // Storable returns a boolean showing whether this object storable
@@ -2157,6 +2183,7 @@ func (o *Object) uploadPresigned(ctx context.Context, in io.Reader, src fs.Objec
 		ParentID:        json.Number(directoryID),
 		RelativePath:    relativePath,
 		WorkspaceID:     o.fs.workspaceID(),
+		LastModified:    src.ModTime(ctx).UnixMilli(),
 	}
 	var fileEntry api.Item
 	if o.fs.entries != nil && o.fs.entries.Batching() {
@@ -2324,6 +2351,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			"parentId":     {target.parentID},
 			"relativePath": {target.relativePath},
 			"workspaceId":  {o.fs.opt.WorkspaceID},
+			"lastModified": {strconv.FormatInt(src.ModTime(ctx).UnixMilli(), 10)},
 		},
 		MultipartContentName: "file",
 		MultipartFileName:    encodedLeaf,
